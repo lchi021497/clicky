@@ -17,6 +17,8 @@ struct GazeWebSocketPayload: Decodable {
     let yaw: Double
     let pitch: Double
     let gaze: [Double]?
+    /// Normalized face bounding box [centerX, centerY, size] in [0, 1] frame coordinates.
+    let head: [Double]?
     let t: Double?
 }
 
@@ -25,23 +27,40 @@ struct GazeWebSocketPayload: Decodable {
 struct TimedGazeSample {
     let yawDegrees: Double
     let pitchDegrees: Double
+    let headCenterX: Double
+    let headCenterY: Double
+    let headSize: Double
     let receivedAt: TimeInterval
 }
 
 struct GazeCalibrationCoefficients: Codable {
-    /// 6 polynomial coefficients for normalized horizontal screen coordinate u in [0, 1]:
-    /// u = c0 + c1*yaw + c2*pitch + c3*yaw^2 + c4*yaw*pitch + c5*pitch^2
+    static let featureCount = 9
+
+    /// 9 coefficients for normalized horizontal screen coordinate u in [0, 1]:
+    /// [1, yaw, pitch, yaw^2, yaw*pitch, pitch^2, headX, headY, headSize]
     let horizontalCoefficients: [Double]
-    /// 6 polynomial coefficients for normalized vertical screen coordinate v in [0, 1].
+    /// 9 coefficients for normalized vertical screen coordinate v in [0, 1].
     let verticalCoefficients: [Double]
     /// Average Euclidean error on the calibration points, expressed as a percentage of screen size.
     let averageErrorPercent: Double
 
-    func predictNormalizedScreenPoint(yaw: Double, pitch: Double) -> CGPoint {
-        let features = Self.polynomialFeatures(yaw: yaw, pitch: pitch)
+    func predictNormalizedScreenPoint(
+        yaw: Double,
+        pitch: Double,
+        headCenterX: Double,
+        headCenterY: Double,
+        headSize: Double
+    ) -> CGPoint {
+        let features = Self.featureVector(
+            yaw: yaw,
+            pitch: pitch,
+            headCenterX: headCenterX,
+            headCenterY: headCenterY,
+            headSize: headSize
+        )
         var predictedX = 0.0
         var predictedY = 0.0
-        for index in 0..<6 {
+        for index in 0..<Self.featureCount {
             predictedX += horizontalCoefficients[index] * features[index]
             predictedY += verticalCoefficients[index] * features[index]
         }
@@ -51,12 +70,20 @@ struct GazeCalibrationCoefficients: Codable {
         )
     }
 
-    static func polynomialFeatures(yaw: Double, pitch: Double) -> [Double] {
-        // Normalize both angles to roughly [-1, 1] using the expected L2CS-Net
-        // range so linear and quadratic terms are well-conditioned for ridge
-        // regression (pitch is negative when looking down).
+    static func featureVector(
+        yaw: Double,
+        pitch: Double,
+        headCenterX: Double,
+        headCenterY: Double,
+        headSize: Double
+    ) -> [Double] {
+        // Normalize gaze angles and center head-position terms around typical
+        // framing so all features are on a comparable scale for ridge regression.
         let normalizedYaw = yaw / 45.0
         let normalizedPitch = pitch / 45.0
+        let centeredHeadX = headCenterX - 0.5
+        let centeredHeadY = headCenterY - 0.5
+        let centeredHeadSize = headSize - 0.25
         return [
             1.0,
             normalizedYaw,
@@ -64,6 +91,9 @@ struct GazeCalibrationCoefficients: Codable {
             normalizedYaw * normalizedYaw,
             normalizedYaw * normalizedPitch,
             normalizedPitch * normalizedPitch,
+            centeredHeadX,
+            centeredHeadY,
+            centeredHeadSize,
         ]
     }
 }
@@ -108,7 +138,7 @@ final class GazeTrackingManager: ObservableObject {
 
     private static let defaultWebSocketURLString = "wss://192.168.0.226:8443/gaze-live/gaze"
     private static let webSocketURLDefaultsKey = "jarvisGazeWebSocketURL"
-    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v3"
+    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v4"
 
     /// One-Euro filter parameters: low minCutoff = rock-steady during fixations;
     /// higher beta = fast snap during saccades.
@@ -271,17 +301,30 @@ final class GazeTrackingManager: ObservableObject {
         latestYawDegrees = payload.yaw
         latestPitchDegrees = payload.pitch
 
+        let headCenterX = (payload.head?.count ?? 0) >= 3 ? payload.head![0] : 0.5
+        let headCenterY = (payload.head?.count ?? 0) >= 3 ? payload.head![1] : 0.5
+        let headSize = (payload.head?.count ?? 0) >= 3 ? payload.head![2] : 0.25
+
         if isCalibrating && isCollectingSamplesForCurrentDot {
             currentDotSamples.append(
                 TimedGazeSample(
                     yawDegrees: payload.yaw,
                     pitchDegrees: payload.pitch,
+                    headCenterX: headCenterX,
+                    headCenterY: headCenterY,
+                    headSize: headSize,
                     receivedAt: Date().timeIntervalSince1970
                 )
             )
         }
 
-        let rawNormalizedPoint = mapAnglesToNormalizedScreenPoint(yaw: payload.yaw, pitch: payload.pitch)
+        let rawNormalizedPoint = mapAnglesToNormalizedScreenPoint(
+            yaw: payload.yaw,
+            pitch: payload.pitch,
+            headCenterX: headCenterX,
+            headCenterY: headCenterY,
+            headSize: headSize
+        )
         let timestamp = payload.t ?? Date().timeIntervalSince1970
         let filteredX = filterX.filter(value: Double(rawNormalizedPoint.x), timestamp: timestamp)
         let filteredY = filterY.filter(value: Double(rawNormalizedPoint.y), timestamp: timestamp)
@@ -300,9 +343,21 @@ final class GazeTrackingManager: ObservableObject {
         }
     }
 
-    private func mapAnglesToNormalizedScreenPoint(yaw: Double, pitch: Double) -> CGPoint {
+    private func mapAnglesToNormalizedScreenPoint(
+        yaw: Double,
+        pitch: Double,
+        headCenterX: Double,
+        headCenterY: Double,
+        headSize: Double
+    ) -> CGPoint {
         if let coefficients = calibrationCoefficients {
-            return coefficients.predictNormalizedScreenPoint(yaw: yaw, pitch: pitch)
+            return coefficients.predictNormalizedScreenPoint(
+                yaw: yaw,
+                pitch: pitch,
+                headCenterX: headCenterX,
+                headCenterY: headCenterY,
+                headSize: headSize
+            )
         }
 
         // Uncalibrated linear fallback so the gaze circle responds immediately.
@@ -347,7 +402,7 @@ final class GazeTrackingManager: ObservableObject {
     }
 
     private func runCalibrationSequence() async {
-        var collectedPairs: [(target: CGPoint, yaw: Double, pitch: Double)] = []
+        var collectedPairs: [(target: CGPoint, yaw: Double, pitch: Double, headCenterX: Double, headCenterY: Double, headSize: Double)] = []
 
         for (stepIndex, targetPoint) in calibrationTargets.enumerated() {
             if Task.isCancelled { return }
@@ -387,11 +442,14 @@ final class GazeTrackingManager: ObservableObject {
                 let pitchValues = samplesForDot.map(\.pitchDegrees)
                 let medianYaw = Self.robustMedian(of: yawValues)
                 let medianPitch = Self.robustMedian(of: pitchValues)
+                let medianHeadCenterX = Self.median(of: samplesForDot.map(\.headCenterX))
+                let medianHeadCenterY = Self.median(of: samplesForDot.map(\.headCenterY))
+                let medianHeadSize = Self.median(of: samplesForDot.map(\.headSize))
                 let yawStandardDeviation = Self.standardDeviation(of: yawValues)
                 let pitchStandardDeviation = Self.standardDeviation(of: pitchValues)
                 print(
                     String(
-                        format: "👁️ GazeTracking: dot %d/%d target=(%.2f, %.2f) -> yaw=%.2f°±%.2f pitch=%.2f°±%.2f (%d/%d samples)",
+                        format: "👁️ GazeTracking: dot %d/%d target=(%.2f, %.2f) -> yaw=%.2f°±%.2f pitch=%.2f°±%.2f head=(%.2f,%.2f,%.2f) (%d/%d samples)",
                         stepIndex + 1,
                         calibrationTargets.count,
                         targetPoint.x,
@@ -400,11 +458,21 @@ final class GazeTrackingManager: ObservableObject {
                         yawStandardDeviation,
                         medianPitch,
                         pitchStandardDeviation,
+                        medianHeadCenterX,
+                        medianHeadCenterY,
+                        medianHeadSize,
                         samplesForDot.count,
                         currentDotSamples.count
                     )
                 )
-                collectedPairs.append((target: targetPoint, yaw: medianYaw, pitch: medianPitch))
+                collectedPairs.append((
+                    target: targetPoint,
+                    yaw: medianYaw,
+                    pitch: medianPitch,
+                    headCenterX: medianHeadCenterX,
+                    headCenterY: medianHeadCenterY,
+                    headSize: medianHeadSize
+                ))
             }
         }
 
@@ -433,8 +501,8 @@ final class GazeTrackingManager: ObservableObject {
     private func loadSavedCalibration() {
         guard let data = UserDefaults.standard.data(forKey: Self.calibrationDefaultsKey),
               let saved = try? JSONDecoder().decode(GazeCalibrationCoefficients.self, from: data),
-              saved.horizontalCoefficients.count == 6,
-              saved.verticalCoefficients.count == 6 else {
+              saved.horizontalCoefficients.count == GazeCalibrationCoefficients.featureCount,
+              saved.verticalCoefficients.count == GazeCalibrationCoefficients.featureCount else {
             return
         }
         calibrationCoefficients = saved
@@ -482,18 +550,24 @@ final class GazeTrackingManager: ObservableObject {
         return sqrt(sumOfSquaredDeviations / Double(values.count - 1))
     }
 
-    /// Fits u = X * c_x and v = X * c_y using ridge regression: (X^T X + lambda * I) c = X^T y.
+    /// Fits u = X * c_x and v = X * c_y using ridge regression: (X^T X + Lambda) c = X^T y.
     private static func fitQuadraticRidgeRegression(
-        samples: [(target: CGPoint, yaw: Double, pitch: Double)],
+        samples: [(target: CGPoint, yaw: Double, pitch: Double, headCenterX: Double, headCenterY: Double, headSize: Double)],
         lambda: Double
     ) -> GazeCalibrationCoefficients? {
-        let featureCount = 6
+        let featureCount = GazeCalibrationCoefficients.featureCount
         var normalMatrix = Array(repeating: Array(repeating: 0.0, count: featureCount), count: featureCount)
         var rhsX = Array(repeating: 0.0, count: featureCount)
         var rhsY = Array(repeating: 0.0, count: featureCount)
 
         for sample in samples {
-            let features = GazeCalibrationCoefficients.polynomialFeatures(yaw: sample.yaw, pitch: sample.pitch)
+            let features = GazeCalibrationCoefficients.featureVector(
+                yaw: sample.yaw,
+                pitch: sample.pitch,
+                headCenterX: sample.headCenterX,
+                headCenterY: sample.headCenterY,
+                headSize: sample.headSize
+            )
             for row in 0..<featureCount {
                 rhsX[row] += features[row] * Double(sample.target.x)
                 rhsY[row] += features[row] * Double(sample.target.y)
@@ -503,9 +577,12 @@ final class GazeTrackingManager: ObservableObject {
             }
         }
 
-        // Regularize non-intercept terms to keep the 6x6 system well-conditioned.
+        // Regularize non-intercept terms. Head-position terms (indices 6..8) get a
+        // stronger penalty so sitting still during calibration does not overfit
+        // bounding-box jitter, while deliberate head shifts are still learned.
         for index in 1..<featureCount {
-            normalMatrix[index][index] += lambda
+            let penalty = index >= 6 ? max(lambda * 50.0, 0.05) : lambda
+            normalMatrix[index][index] += penalty
         }
 
         guard let horizontalCoefficients = solveLinearSystem(matrix: normalMatrix, rhs: rhsX),
@@ -521,7 +598,13 @@ final class GazeTrackingManager: ObservableObject {
 
         var totalError = 0.0
         for sample in samples {
-            let predicted = candidate.predictNormalizedScreenPoint(yaw: sample.yaw, pitch: sample.pitch)
+            let predicted = candidate.predictNormalizedScreenPoint(
+                yaw: sample.yaw,
+                pitch: sample.pitch,
+                headCenterX: sample.headCenterX,
+                headCenterY: sample.headCenterY,
+                headSize: sample.headSize
+            )
             let dx = Double(predicted.x - sample.target.x)
             let dy = Double(predicted.y - sample.target.y)
             totalError += sqrt(dx * dx + dy * dy)
