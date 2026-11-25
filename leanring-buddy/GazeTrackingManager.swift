@@ -44,7 +44,18 @@ struct GazeCalibrationCoefficients: Codable {
     }
 
     static func polynomialFeatures(yaw: Double, pitch: Double) -> [Double] {
-        return [1.0, yaw, pitch, yaw * yaw, yaw * pitch, pitch * pitch]
+        // Normalize degrees to roughly [-1, 1] so linear and quadratic terms
+        // are well-conditioned for ridge regression.
+        let normalizedYaw = yaw / 25.0
+        let normalizedPitch = pitch / 15.0
+        return [
+            1.0,
+            normalizedYaw,
+            normalizedPitch,
+            normalizedYaw * normalizedYaw,
+            normalizedYaw * normalizedPitch,
+            normalizedPitch * normalizedPitch,
+        ]
     }
 }
 
@@ -88,15 +99,20 @@ final class GazeTrackingManager: ObservableObject {
 
     private static let defaultWebSocketURLString = "wss://192.168.0.226:8443/gaze-live/gaze"
     private static let webSocketURLDefaultsKey = "jarvisGazeWebSocketURL"
-    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients"
+    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v2"
 
-    /// Exponential moving average smoothing factor (0 = frozen, 1 = raw/unsmoothed).
-    private let smoothingAlpha: Double = 0.25
+    /// One-Euro filter parameters: low minCutoff = rock-steady during fixations;
+    /// higher beta = fast snap during saccades.
+    private let oneEuroMinCutoff: Double = 0.6
+    private let oneEuroBeta: Double = 4.0
+    private let oneEuroDerivativeCutoff: Double = 1.0
+    /// Ignore tiny sub-1% jitter when fixating.
+    private let fixationDeadzoneNormalized: Double = 0.008
 
     /// Time to wait after showing a calibration dot so the user's eyes finish moving to it.
-    private let calibrationSettleSeconds: Double = 0.45
+    private let calibrationSettleSeconds: Double = 0.55
     /// Time to collect gaze samples at each calibration dot.
-    private let calibrationCollectSeconds: Double = 0.85
+    private let calibrationCollectSeconds: Double = 1.1
 
     // MARK: - Private Properties
 
@@ -111,6 +127,8 @@ final class GazeTrackingManager: ObservableObject {
     private var isCollectingSamplesForCurrentDot: Bool = false
     private var currentDotYawSamples: [Double] = []
     private var currentDotPitchSamples: [Double] = []
+    private var filterX = OneEuroFilter(minCutoff: 0.6, beta: 4.0, derivativeCutoff: 1.0)
+    private var filterY = OneEuroFilter(minCutoff: 0.6, beta: 4.0, derivativeCutoff: 1.0)
 
     var webSocketURLString: String {
         get {
@@ -154,6 +172,8 @@ final class GazeTrackingManager: ObservableObject {
         isConnected = false
         hasFace = false
         smoothedNormalizedGazePoint = nil
+        filterX.reset()
+        filterY.reset()
     }
 
     // MARK: - WebSocket Connection
@@ -244,12 +264,21 @@ final class GazeTrackingManager: ObservableObject {
         }
 
         let rawNormalizedPoint = mapAnglesToNormalizedScreenPoint(yaw: payload.yaw, pitch: payload.pitch)
+        let timestamp = payload.t ?? Date().timeIntervalSince1970
+        let filteredX = filterX.filter(value: Double(rawNormalizedPoint.x), timestamp: timestamp)
+        let filteredY = filterY.filter(value: Double(rawNormalizedPoint.y), timestamp: timestamp)
+        let candidatePoint = CGPoint(
+            x: min(max(filteredX, 0.0), 1.0),
+            y: min(max(filteredY, 0.0), 1.0)
+        )
+
         if let previousPoint = smoothedNormalizedGazePoint {
-            let smoothedX = previousPoint.x + smoothingAlpha * (rawNormalizedPoint.x - previousPoint.x)
-            let smoothedY = previousPoint.y + smoothingAlpha * (rawNormalizedPoint.y - previousPoint.y)
-            smoothedNormalizedGazePoint = CGPoint(x: smoothedX, y: smoothedY)
+            let distance = hypot(Double(candidatePoint.x - previousPoint.x), Double(candidatePoint.y - previousPoint.y))
+            if distance >= fixationDeadzoneNormalized {
+                smoothedNormalizedGazePoint = candidatePoint
+            }
         } else {
-            smoothedNormalizedGazePoint = rawNormalizedPoint
+            smoothedNormalizedGazePoint = candidatePoint
         }
     }
 
@@ -343,7 +372,7 @@ final class GazeTrackingManager: ObservableObject {
             return
         }
 
-        if let fitted = Self.fitQuadraticRidgeRegression(samples: collectedPairs, lambda: 1e-3) {
+        if let fitted = Self.fitQuadraticRidgeRegression(samples: collectedPairs, lambda: 0.05) {
             calibrationCoefficients = fitted
             isCalibrated = true
             lastCalibrationErrorPercent = fitted.averageErrorPercent
@@ -497,5 +526,58 @@ private final class GazeWebSocketTrustDelegate: NSObject, URLSessionDelegate {
             return
         }
         completionHandler(.performDefaultHandling, nil)
+    }
+}
+
+/// Adaptive low-pass filter (Casiez et al., CHI 2012) that heavily smooths
+/// jitter during fixations while remaining responsive during fast eye movements.
+private struct OneEuroFilter {
+    let minCutoff: Double
+    let beta: Double
+    let derivativeCutoff: Double
+
+    private var previousTimestamp: Double?
+    private var previousFilteredValue: Double?
+    private var previousFilteredDerivative: Double = 0.0
+
+    init(minCutoff: Double, beta: Double, derivativeCutoff: Double) {
+        self.minCutoff = minCutoff
+        self.beta = beta
+        self.derivativeCutoff = derivativeCutoff
+    }
+
+    mutating func reset() {
+        previousTimestamp = nil
+        previousFilteredValue = nil
+        previousFilteredDerivative = 0.0
+    }
+
+    mutating func filter(value: Double, timestamp: Double) -> Double {
+        guard let lastTimestamp = previousTimestamp,
+              let lastValue = previousFilteredValue else {
+            previousTimestamp = timestamp
+            previousFilteredValue = value
+            previousFilteredDerivative = 0.0
+            return value
+        }
+
+        let dt = max(timestamp - lastTimestamp, 1.0 / 120.0)
+        let rawDerivative = (value - lastValue) / dt
+        let derivativeAlpha = Self.smoothingFactor(dt: dt, cutoff: derivativeCutoff)
+        let filteredDerivative = previousFilteredDerivative + derivativeAlpha * (rawDerivative - previousFilteredDerivative)
+
+        let adaptiveCutoff = minCutoff + beta * abs(filteredDerivative)
+        let valueAlpha = Self.smoothingFactor(dt: dt, cutoff: adaptiveCutoff)
+        let filteredValue = lastValue + valueAlpha * (value - lastValue)
+
+        previousTimestamp = timestamp
+        previousFilteredValue = filteredValue
+        previousFilteredDerivative = filteredDerivative
+        return filteredValue
+    }
+
+    private static func smoothingFactor(dt: Double, cutoff: Double) -> Double {
+        let tau = 1.0 / (2.0 * Double.pi * cutoff)
+        return 1.0 / (1.0 + tau / dt)
     }
 }
