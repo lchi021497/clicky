@@ -145,8 +145,8 @@ final class GazeTrackingManager: ObservableObject {
     private let oneEuroMinCutoff: Double = 0.6
     private let oneEuroBeta: Double = 4.0
     private let oneEuroDerivativeCutoff: Double = 1.0
-    /// Ignore tiny sub-1% jitter when fixating.
-    private let fixationDeadzoneNormalized: Double = 0.008
+    /// Ignore tiny jitter below 1.5% of screen size when fixating.
+    private let fixationDeadzoneNormalized: Double = 0.015
 
     /// Time to wait after showing a calibration dot so the user's eyes finish
     /// moving and the (laggy) camera pipeline catches up with the new dot.
