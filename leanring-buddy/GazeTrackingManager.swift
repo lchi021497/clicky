@@ -20,6 +20,14 @@ struct GazeWebSocketPayload: Decodable {
     let t: Double?
 }
 
+/// One raw gaze reading stamped when it arrived, so calibration can discard
+/// samples that still describe the previous dot (the video pipeline lags).
+struct TimedGazeSample {
+    let yawDegrees: Double
+    let pitchDegrees: Double
+    let receivedAt: TimeInterval
+}
+
 struct GazeCalibrationCoefficients: Codable {
     /// 6 polynomial coefficients for normalized horizontal screen coordinate u in [0, 1]:
     /// u = c0 + c1*yaw + c2*pitch + c3*yaw^2 + c4*yaw*pitch + c5*pitch^2
@@ -44,10 +52,11 @@ struct GazeCalibrationCoefficients: Codable {
     }
 
     static func polynomialFeatures(yaw: Double, pitch: Double) -> [Double] {
-        // Normalize degrees to roughly [-1, 1] so linear and quadratic terms
-        // are well-conditioned for ridge regression.
-        let normalizedYaw = yaw / 25.0
-        let normalizedPitch = pitch / 15.0
+        // Normalize both angles to roughly [-1, 1] using the expected L2CS-Net
+        // range so linear and quadratic terms are well-conditioned for ridge
+        // regression (pitch is negative when looking down).
+        let normalizedYaw = yaw / 45.0
+        let normalizedPitch = pitch / 45.0
         return [
             1.0,
             normalizedYaw,
@@ -99,7 +108,7 @@ final class GazeTrackingManager: ObservableObject {
 
     private static let defaultWebSocketURLString = "wss://192.168.0.226:8443/gaze-live/gaze"
     private static let webSocketURLDefaultsKey = "jarvisGazeWebSocketURL"
-    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v2"
+    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v3"
 
     /// One-Euro filter parameters: low minCutoff = rock-steady during fixations;
     /// higher beta = fast snap during saccades.
@@ -109,10 +118,15 @@ final class GazeTrackingManager: ObservableObject {
     /// Ignore tiny sub-1% jitter when fixating.
     private let fixationDeadzoneNormalized: Double = 0.008
 
-    /// Time to wait after showing a calibration dot so the user's eyes finish moving to it.
-    private let calibrationSettleSeconds: Double = 0.55
+    /// Time to wait after showing a calibration dot so the user's eyes finish
+    /// moving and the (laggy) camera pipeline catches up with the new dot.
+    private let calibrationSettleSeconds: Double = 1.6
     /// Time to collect gaze samples at each calibration dot.
-    private let calibrationCollectSeconds: Double = 1.1
+    private let calibrationCollectSeconds: Double = 1.4
+    /// Samples received right after collection starts can still describe the
+    /// previous dot because video capture + inference + WebSocket add latency.
+    /// Ignore this much of the collection window before computing the median.
+    private let calibrationSampleWarmupSeconds: Double = 0.5
 
     // MARK: - Private Properties
 
@@ -125,8 +139,7 @@ final class GazeTrackingManager: ObservableObject {
 
     private var calibrationCoefficients: GazeCalibrationCoefficients?
     private var isCollectingSamplesForCurrentDot: Bool = false
-    private var currentDotYawSamples: [Double] = []
-    private var currentDotPitchSamples: [Double] = []
+    private var currentDotSamples: [TimedGazeSample] = []
     private var filterX = OneEuroFilter(minCutoff: 0.6, beta: 4.0, derivativeCutoff: 1.0)
     private var filterY = OneEuroFilter(minCutoff: 0.6, beta: 4.0, derivativeCutoff: 1.0)
 
@@ -259,8 +272,13 @@ final class GazeTrackingManager: ObservableObject {
         latestPitchDegrees = payload.pitch
 
         if isCalibrating && isCollectingSamplesForCurrentDot {
-            currentDotYawSamples.append(payload.yaw)
-            currentDotPitchSamples.append(payload.pitch)
+            currentDotSamples.append(
+                TimedGazeSample(
+                    yawDegrees: payload.yaw,
+                    pitchDegrees: payload.pitch,
+                    receivedAt: Date().timeIntervalSince1970
+                )
+            )
         }
 
         let rawNormalizedPoint = mapAnglesToNormalizedScreenPoint(yaw: payload.yaw, pitch: payload.pitch)
@@ -288,8 +306,9 @@ final class GazeTrackingManager: ObservableObject {
         }
 
         // Uncalibrated linear fallback so the gaze circle responds immediately.
-        let normalizedX = min(max((yaw + 25.0) / 50.0, 0.0), 1.0)
-        let normalizedY = min(max((pitch + 15.0) / 30.0, 0.0), 1.0)
+        // L2CS-Net yaw spans roughly ±45°; pitch is negative when looking down.
+        let normalizedX = min(max((yaw + 45.0) / 90.0, 0.0), 1.0)
+        let normalizedY = min(max((-pitch - 5.0) / 55.0, 0.0), 1.0)
         return CGPoint(x: normalizedX, y: normalizedY)
     }
 
@@ -337,15 +356,16 @@ final class GazeTrackingManager: ObservableObject {
             currentCalibrationTarget = targetPoint
             calibrationSampleProgress = 0.0
             isCollectingSamplesForCurrentDot = false
-            currentDotYawSamples.removeAll()
-            currentDotPitchSamples.removeAll()
+            currentDotSamples.removeAll()
 
-            // Wait for the user's eyes to settle on the new dot.
+            // Wait for the user's eyes to move to the new dot and for the
+            // lagging camera pipeline to deliver gaze from that dot.
             let settleNanoseconds = UInt64(calibrationSettleSeconds * 1_000_000_000)
             try? await Task.sleep(nanoseconds: settleNanoseconds)
             if Task.isCancelled { return }
 
             // Collect gaze samples while animating the progress ring.
+            let collectionStartTime = Date().timeIntervalSince1970
             isCollectingSamplesForCurrentDot = true
             let progressSteps = 20
             let stepSleepNanoseconds = UInt64((calibrationCollectSeconds / Double(progressSteps)) * 1_000_000_000)
@@ -356,19 +376,32 @@ final class GazeTrackingManager: ObservableObject {
             }
             isCollectingSamplesForCurrentDot = false
 
-            if !currentDotYawSamples.isEmpty && !currentDotPitchSamples.isEmpty {
-                let medianYaw = Self.median(of: currentDotYawSamples)
-                let medianPitch = Self.median(of: currentDotPitchSamples)
+            // Ignore warm-up samples that may still describe the previous dot.
+            let warmedUpSamples = currentDotSamples.filter {
+                $0.receivedAt >= collectionStartTime + calibrationSampleWarmupSeconds
+            }
+            let samplesForDot = warmedUpSamples.count >= 5 ? warmedUpSamples : currentDotSamples
+
+            if !samplesForDot.isEmpty {
+                let yawValues = samplesForDot.map(\.yawDegrees)
+                let pitchValues = samplesForDot.map(\.pitchDegrees)
+                let medianYaw = Self.robustMedian(of: yawValues)
+                let medianPitch = Self.robustMedian(of: pitchValues)
+                let yawStandardDeviation = Self.standardDeviation(of: yawValues)
+                let pitchStandardDeviation = Self.standardDeviation(of: pitchValues)
                 print(
                     String(
-                        format: "👁️ GazeTracking: dot %d/%d target=(%.2f, %.2f) -> yaw=%.2f° pitch=%.2f° (%d samples)",
+                        format: "👁️ GazeTracking: dot %d/%d target=(%.2f, %.2f) -> yaw=%.2f°±%.2f pitch=%.2f°±%.2f (%d/%d samples)",
                         stepIndex + 1,
                         calibrationTargets.count,
                         targetPoint.x,
                         targetPoint.y,
                         medianYaw,
+                        yawStandardDeviation,
                         medianPitch,
-                        currentDotYawSamples.count
+                        pitchStandardDeviation,
+                        samplesForDot.count,
+                        currentDotSamples.count
                     )
                 )
                 collectedPairs.append((target: targetPoint, yaw: medianYaw, pitch: medianPitch))
@@ -423,6 +456,30 @@ final class GazeTrackingManager: ObservableObject {
             return sortedValues[count / 2]
         }
         return 0.5 * (sortedValues[count / 2 - 1] + sortedValues[count / 2])
+    }
+
+    /// Median after discarding samples that deviate more than 3 robust sigmas
+    /// (from the median absolute deviation). Rejects blinks and tracking glitches.
+    private static func robustMedian(of values: [Double]) -> Double {
+        guard !values.isEmpty else { return 0.0 }
+        let medianValue = median(of: values)
+        let deviations = values.map { abs($0 - medianValue) }
+        let medianAbsoluteDeviation = median(of: deviations)
+        // 1.4826 * MAD approximates the standard deviation for normal data.
+        // Floor it so a nearly constant signal does not reject every sample.
+        let robustSigma = max(1.4826 * medianAbsoluteDeviation, 0.5)
+        let inliers = values.filter { abs($0 - medianValue) <= 3.0 * robustSigma }
+        return inliers.isEmpty ? medianValue : median(of: inliers)
+    }
+
+    private static func standardDeviation(of values: [Double]) -> Double {
+        guard values.count > 1 else { return 0.0 }
+        let mean = values.reduce(0.0, +) / Double(values.count)
+        let sumOfSquaredDeviations = values.reduce(0.0) { partialResult, value in
+            let deviation = value - mean
+            return partialResult + deviation * deviation
+        }
+        return sqrt(sumOfSquaredDeviations / Double(values.count - 1))
     }
 
     /// Fits u = X * c_x and v = X * c_y using ridge regression: (X^T X + lambda * I) c = X^T y.
