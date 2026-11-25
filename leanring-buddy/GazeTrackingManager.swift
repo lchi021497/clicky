@@ -101,6 +101,7 @@ final class GazeTrackingManager: ObservableObject {
     // MARK: - Private Properties
 
     private var webSocketURLSession: URLSession?
+    private let webSocketTrustDelegate = GazeWebSocketTrustDelegate()
     private var webSocketTask: URLSessionWebSocketTask?
     private var receiveLoopTask: Task<Void, Never>?
     private var reconnectTask: Task<Void, Never>?
@@ -166,7 +167,11 @@ final class GazeTrackingManager: ObservableObject {
         if webSocketURLSession == nil {
             let configuration = URLSessionConfiguration.default
             configuration.waitsForConnectivity = false
-            webSocketURLSession = URLSession(configuration: configuration)
+            webSocketURLSession = URLSession(
+                configuration: configuration,
+                delegate: webSocketTrustDelegate,
+                delegateQueue: nil
+            )
         }
 
         guard let session = webSocketURLSession else { return }
@@ -475,5 +480,22 @@ final class GazeTrackingManager: ObservableObject {
             solution[row] = sum / augmented[row][row]
         }
         return solution
+    }
+}
+
+/// Trusts Caddy's local LAN certificate for the Jarvis gaze server so
+/// URLSessionWebSocketTask doesn't reject IP-based internal TLS certs.
+private final class GazeWebSocketTrustDelegate: NSObject, URLSessionDelegate {
+    func urlSession(
+        _ session: URLSession,
+        didReceive challenge: URLAuthenticationChallenge,
+        completionHandler: @escaping (URLSession.AuthChallengeDisposition, URLCredential?) -> Void
+    ) {
+        if challenge.protectionSpace.authenticationMethod == NSURLAuthenticationMethodServerTrust,
+           let serverTrust = challenge.protectionSpace.serverTrust {
+            completionHandler(.useCredential, URLCredential(trust: serverTrust))
+            return
+        }
+        completionHandler(.performDefaultHandling, nil)
     }
 }
