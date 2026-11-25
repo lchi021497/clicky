@@ -359,6 +359,18 @@ final class GazeTrackingManager: ObservableObject {
             if !currentDotYawSamples.isEmpty && !currentDotPitchSamples.isEmpty {
                 let medianYaw = Self.median(of: currentDotYawSamples)
                 let medianPitch = Self.median(of: currentDotPitchSamples)
+                print(
+                    String(
+                        format: "👁️ GazeTracking: dot %d/%d target=(%.2f, %.2f) -> yaw=%.2f° pitch=%.2f° (%d samples)",
+                        stepIndex + 1,
+                        calibrationTargets.count,
+                        targetPoint.x,
+                        targetPoint.y,
+                        medianYaw,
+                        medianPitch,
+                        currentDotYawSamples.count
+                    )
+                )
                 collectedPairs.append((target: targetPoint, yaw: medianYaw, pitch: medianPitch))
             }
         }
@@ -372,7 +384,7 @@ final class GazeTrackingManager: ObservableObject {
             return
         }
 
-        if let fitted = Self.fitQuadraticRidgeRegression(samples: collectedPairs, lambda: 0.05) {
+        if let fitted = Self.fitQuadraticRidgeRegression(samples: collectedPairs, lambda: 1e-3) {
             calibrationCoefficients = fitted
             isCalibrated = true
             lastCalibrationErrorPercent = fitted.averageErrorPercent
