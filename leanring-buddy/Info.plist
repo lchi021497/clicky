@@ -12,6 +12,8 @@
 	<string>assemblyai</string>
 	<key>NSMicrophoneUsageDescription</key>
 	<string>Clicky uses your microphone so you can talk to it</string>
+	<key>NSLocalNetworkUsageDescription</key>
+	<string>Clicky connects to your local Jarvis gaze server on the LAN.</string>
 	<key>NSScreenCaptureUsageDescription</key>
 	<string>Clicky needs screen recording access to see your screen and help you.</string>
 	<key>NSSpeechRecognitionUsageDescription</key>
