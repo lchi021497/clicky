@@ -106,6 +106,7 @@ struct BlueCursorView: View {
     let screenFrame: CGRect
     let isFirstAppearance: Bool
     @ObservedObject var companionManager: CompanionManager
+    @ObservedObject var gazeTrackingManager: GazeTrackingManager
 
     @State private var cursorPosition: CGPoint
     @State private var isCursorOnThisScreen: Bool
@@ -114,6 +115,7 @@ struct BlueCursorView: View {
         self.screenFrame = screenFrame
         self.isFirstAppearance = isFirstAppearance
         self.companionManager = companionManager
+        self.gazeTrackingManager = companionManager.gazeTrackingManager
 
         // Seed the cursor position from the current mouse location so the
         // buddy doesn't flash at (0,0) before onAppear fires.
@@ -180,6 +182,11 @@ struct BlueCursorView: View {
         "here it is!",
         "found it!"
     ]
+
+    private var isPrimaryScreen: Bool {
+        guard let primaryFrame = NSScreen.screens.first?.frame else { return true }
+        return screenFrame == primaryFrame
+    }
 
     var body: some View {
         ZStack {
@@ -335,6 +342,68 @@ struct BlueCursorView: View {
                 .position(cursorPosition)
                 .animation(.spring(response: 0.2, dampingFraction: 0.6, blendDuration: 0), value: cursorPosition)
                 .animation(.easeIn(duration: 0.15), value: companionManager.voiceState)
+
+            // Gaze tracking circle (shown on primary screen when enabled and face is detected)
+            if isPrimaryScreen,
+               gazeTrackingManager.isEnabled,
+               gazeTrackingManager.hasFace,
+               !gazeTrackingManager.isCalibrating,
+               let normalizedGazePoint = gazeTrackingManager.smoothedNormalizedGazePoint {
+                Circle()
+                    .fill(Color.green.opacity(0.14))
+                    .overlay(
+                        Circle()
+                            .stroke(Color.green.opacity(0.85), lineWidth: 2.5)
+                    )
+                    .frame(width: 48, height: 48)
+                    .shadow(color: Color.green.opacity(0.45), radius: 8)
+                    .position(
+                        x: normalizedGazePoint.x * screenFrame.width,
+                        y: normalizedGazePoint.y * screenFrame.height
+                    )
+                    .allowsHitTesting(false)
+            }
+
+            // 9-point gaze calibration target overlay
+            if isPrimaryScreen,
+               gazeTrackingManager.isCalibrating,
+               let calibrationTarget = gazeTrackingManager.currentCalibrationTarget {
+                let targetX = calibrationTarget.x * screenFrame.width
+                let targetY = calibrationTarget.y * screenFrame.height
+                let stepNumber = gazeTrackingManager.currentCalibrationStepIndex + 1
+                let totalSteps = gazeTrackingManager.calibrationTargets.count
+
+                ZStack {
+                    Circle()
+                        .stroke(Color.white.opacity(0.25), lineWidth: 3)
+                        .frame(width: 44, height: 44)
+
+                    Circle()
+                        .trim(from: 0, to: CGFloat(gazeTrackingManager.calibrationSampleProgress))
+                        .stroke(Color.green, style: StrokeStyle(lineWidth: 3.5, lineCap: .round))
+                        .rotationEffect(.degrees(-90))
+                        .frame(width: 44, height: 44)
+
+                    Circle()
+                        .fill(Color.green)
+                        .frame(width: 12, height: 12)
+                        .shadow(color: Color.green.opacity(0.8), radius: 6)
+                }
+                .position(x: targetX, y: targetY)
+                .allowsHitTesting(false)
+
+                Text("Look at the green dot (\(stepNumber)/\(totalSteps))")
+                    .font(.system(size: 14, weight: .semibold))
+                    .foregroundColor(.white)
+                    .padding(.horizontal, 14)
+                    .padding(.vertical, 8)
+                    .background(
+                        Capsule()
+                            .fill(Color.black.opacity(0.75))
+                    )
+                    .position(x: screenFrame.width / 2, y: 60)
+                    .allowsHitTesting(false)
+            }
 
         }
         .frame(width: screenFrame.width, height: screenFrame.height)

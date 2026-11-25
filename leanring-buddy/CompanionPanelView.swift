@@ -69,6 +69,12 @@ struct CompanionPanelView: View {
             Spacer()
                 .frame(height: 12)
 
+            gazeTrackingSection
+                .padding(.horizontal, 16)
+
+            Spacer()
+                .frame(height: 12)
+
             Divider()
                 .background(DS.Colors.borderSubtle)
                 .padding(.horizontal, 16)
@@ -545,6 +551,20 @@ struct CompanionPanelView: View {
 
 
 
+    // MARK: - Gaze Tracking Section
+
+    private var gazeTrackingSection: some View {
+        GazeTrackingPanelControls(
+            gazeTrackingManager: companionManager.gazeTrackingManager,
+            onToggleEnabled: { enabled in
+                companionManager.setGazeTrackingEnabled(enabled)
+            },
+            onStartCalibration: {
+                companionManager.startGazeCalibration()
+            }
+        )
+    }
+
     // MARK: - Show Clicky Cursor Toggle
 
     private var showClickyCursorToggleRow: some View {
@@ -758,4 +778,99 @@ struct CompanionPanelView: View {
         }
     }
 
+}
+
+private struct GazeTrackingPanelControls: View {
+    @ObservedObject var gazeTrackingManager: GazeTrackingManager
+    let onToggleEnabled: (Bool) -> Void
+    let onStartCalibration: () -> Void
+
+    var body: some View {
+        VStack(spacing: 8) {
+            HStack {
+                HStack(spacing: 8) {
+                    Image(systemName: "eye.circle")
+                        .font(.system(size: 12, weight: .medium))
+                        .foregroundColor(statusColor)
+                        .frame(width: 16)
+
+                    Text("Gaze Circle")
+                        .font(.system(size: 13, weight: .medium))
+                        .foregroundColor(DS.Colors.textSecondary)
+                }
+
+                Spacer()
+
+                Toggle("", isOn: Binding(
+                    get: { gazeTrackingManager.isEnabled },
+                    set: { onToggleEnabled($0) }
+                ))
+                .toggleStyle(.switch)
+                .labelsHidden()
+                .tint(DS.Colors.accent)
+                .scaleEffect(0.8)
+            }
+
+            HStack {
+                Text(statusLabel)
+                    .font(.system(size: 11, weight: .regular))
+                    .foregroundColor(DS.Colors.textTertiary)
+
+                Spacer()
+
+                Button(action: onStartCalibration) {
+                    Text(gazeTrackingManager.isCalibrated ? "Recalibrate" : "Calibrate Gaze")
+                        .font(.system(size: 11, weight: .semibold))
+                        .foregroundColor(DS.Colors.textPrimary)
+                        .padding(.horizontal, 10)
+                        .padding(.vertical, 5)
+                        .background(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .fill(Color.white.opacity(0.08))
+                        )
+                        .overlay(
+                            RoundedRectangle(cornerRadius: 6, style: .continuous)
+                                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+                        )
+                }
+                .buttonStyle(.plain)
+                .pointerCursor()
+            }
+        }
+        .padding(10)
+        .background(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .fill(Color.white.opacity(0.03))
+        )
+        .overlay(
+            RoundedRectangle(cornerRadius: DS.CornerRadius.medium, style: .continuous)
+                .stroke(DS.Colors.borderSubtle, lineWidth: 0.5)
+        )
+    }
+
+    private var statusColor: Color {
+        if !gazeTrackingManager.isEnabled {
+            return DS.Colors.textTertiary
+        }
+        if gazeTrackingManager.hasFace {
+            return DS.Colors.success
+        }
+        return gazeTrackingManager.isConnected ? DS.Colors.blue400 : DS.Colors.textTertiary
+    }
+
+    private var statusLabel: String {
+        if gazeTrackingManager.isCalibrating {
+            return "Calibrating..."
+        }
+        if let errorPercent = gazeTrackingManager.lastCalibrationErrorPercent {
+            return String(format: "Calibrated · %.1f%% avg error", errorPercent)
+        }
+        if !gazeTrackingManager.isEnabled {
+            return "Off"
+        }
+        if gazeTrackingManager.hasFace {
+            return "Tracking (uncalibrated)"
+        }
+        return gazeTrackingManager.isConnected ? "Waiting for face..." : "Connecting..."
+    }
 }

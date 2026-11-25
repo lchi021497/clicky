@@ -65,6 +65,7 @@ final class CompanionManager: ObservableObject {
     let buddyDictationManager = BuddyDictationManager()
     let globalPushToTalkShortcutMonitor = GlobalPushToTalkShortcutMonitor()
     let overlayWindowManager = OverlayWindowManager()
+    let gazeTrackingManager = GazeTrackingManager()
     // Response text is now displayed inline on the cursor overlay via
     // streamingResponseText, so no separate response overlay manager is needed.
 
@@ -287,7 +288,27 @@ final class CompanionManager: ObservableObject {
         detectedElementBubbleText = nil
     }
 
+    func setGazeTrackingEnabled(_ enabled: Bool) {
+        gazeTrackingManager.setEnabled(enabled)
+        if enabled && !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+    }
+
+    func startGazeCalibration() {
+        NotificationCenter.default.post(name: .clickyDismissPanel, object: nil)
+        if !isOverlayVisible {
+            overlayWindowManager.hasShownOverlayBefore = true
+            overlayWindowManager.showOverlay(onScreens: NSScreen.screens, companionManager: self)
+            isOverlayVisible = true
+        }
+        gazeTrackingManager.startCalibration()
+    }
+
     func stop() {
+        gazeTrackingManager.stop()
         globalPushToTalkShortcutMonitor.stop()
         buddyDictationManager.cancelCurrentDictation()
         overlayWindowManager.hideOverlay()
