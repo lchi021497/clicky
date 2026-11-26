@@ -41,6 +41,10 @@ struct GazeCalibrationCoefficients: Codable {
     let horizontalCoefficients: [Double]
     /// 9 coefficients for normalized vertical screen coordinate v in [0, 1].
     let verticalCoefficients: [Double]
+    /// Affine correction from ridge prediction to target: [a, b, c] for x' = a*x + b*y + c
+    let correctionHorizontalCoefficients: [Double]
+    /// Affine correction from ridge prediction to target: [a, b, c] for y' = a*x + b*y + c
+    let correctionVerticalCoefficients: [Double]
     /// Average Euclidean error on the calibration points, expressed as a percentage of screen size.
     let averageErrorPercent: Double
 
@@ -63,6 +67,15 @@ struct GazeCalibrationCoefficients: Codable {
         for index in 0..<Self.featureCount {
             predictedX += horizontalCoefficients[index] * features[index]
             predictedY += verticalCoefficients[index] * features[index]
+        }
+        // Apply affine residual correction (if present).
+        if correctionHorizontalCoefficients.count == 3 && correctionVerticalCoefficients.count == 3 {
+            let cx = correctionHorizontalCoefficients
+            let cy = correctionVerticalCoefficients
+            let correctedX = cx[0] * predictedX + cx[1] * predictedY + cx[2]
+            let correctedY = cy[0] * predictedX + cy[1] * predictedY + cy[2]
+            predictedX = correctedX
+            predictedY = correctedY
         }
         return CGPoint(
             x: min(max(predictedX, 0.0), 1.0),
@@ -145,7 +158,7 @@ final class GazeTrackingManager: ObservableObject {
 
     private static let defaultWebSocketURLString = "wss://192.168.0.226:8443/gaze-live/gaze"
     private static let webSocketURLDefaultsKey = "jarvisGazeWebSocketURL"
-    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v5"
+    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v6"
 
     /// One-Euro filter parameters: low minCutoff = rock-steady during fixations;
     /// higher beta = fast snap during saccades.
@@ -603,6 +616,9 @@ final class GazeTrackingManager: ObservableObject {
             averageErrorPercent: 0.0
         )
 
+        // Compute ridge predictions and residuals, then fit an affine correction.
+        var ridgePoints: [[Double]] = []
+        var targetPoints: [[Double]] = []
         var totalError = 0.0
         for sample in samples {
             let predicted = candidate.predictNormalizedScreenPoint(
@@ -612,15 +628,64 @@ final class GazeTrackingManager: ObservableObject {
                 headCenterY: sample.headCenterY,
                 headSize: sample.headSize
             )
+            ridgePoints.append([Double(predicted.x), Double(predicted.y)])
+            targetPoints.append([Double(sample.target.x), Double(sample.target.y)])
             let dx = Double(predicted.x - sample.target.x)
             let dy = Double(predicted.y - sample.target.y)
             totalError += sqrt(dx * dx + dy * dy)
         }
+
+        // Fit affine correction: target = A * ridge + b (per axis).
+        let n = ridgePoints.count
+        var sumXX = 0.0, sumXY = 0.0, sumX = 0.0
+        var sumYX = 0.0, sumYY = 0.0, sumY = 0.0
+        var sumTX = 0.0, sumTY = 0.0
+        for i in 0..<n {
+            let rx = ridgePoints[i][0]
+            let ry = ridgePoints[i][1]
+            let tx = targetPoints[i][0]
+            let ty = targetPoints[i][1]
+            sumXX += rx * rx
+            sumXY += rx * ry
+            sumX += rx
+            sumYX += ry * rx
+            sumYY += ry * ry
+            sumY += ry
+            sumTX += tx
+            sumTY += ty
+        }
+        // Solve 3x3 for x and y using normal equations with intercept.
+        // Matrix [[sumXX,sumXY,sumX],[sumYX,sumYY,sumY],[sumX,sumY,n]]
+        let matrix: [[Double]] = [
+            [sumXX, sumXY, sumX],
+            [sumYX, sumYY, sumY],
+            [sumX, sumY, Double(n)]
+        ]
+        // Solve least squares via 3x3 normal equations for each axis.
+        let aMatrix = matrix
+        var rhsXVec = Array(repeating: 0.0, count: 3)
+        var rhsYVec = Array(repeating: 0.0, count: 3)
+        for i in 0..<n {
+            rhsXVec[0] += ridgePoints[i][0] * targetPoints[i][0]
+            rhsXVec[1] += ridgePoints[i][1] * targetPoints[i][0]
+            rhsXVec[2] += targetPoints[i][0]
+            rhsYVec[0] += ridgePoints[i][0] * targetPoints[i][1]
+            rhsYVec[1] += ridgePoints[i][1] * targetPoints[i][1]
+            rhsYVec[2] += targetPoints[i][1]
+        }
+        let solX = Self.solveLinearSystem(matrix: aMatrix, rhs: rhsXVec) ?? [1.0, 0.0, 0.0]
+        let solY = Self.solveLinearSystem(matrix: aMatrix, rhs: rhsYVec) ?? [0.0, 1.0, 0.0]
+
+        let correctionX = [solX[0], solX[1], solX[2]]
+        let correctionY = [solY[0], solY[1], solY[2]]
+
         let averageErrorPercent = (totalError / Double(samples.count)) * 100.0
 
         return GazeCalibrationCoefficients(
             horizontalCoefficients: horizontalCoefficients,
             verticalCoefficients: verticalCoefficients,
+            correctionHorizontalCoefficients: correctionX,
+            correctionVerticalCoefficients: correctionY,
             averageErrorPercent: averageErrorPercent
         )
     }
