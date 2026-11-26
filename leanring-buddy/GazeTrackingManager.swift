@@ -613,6 +613,8 @@ final class GazeTrackingManager: ObservableObject {
         let candidate = GazeCalibrationCoefficients(
             horizontalCoefficients: horizontalCoefficients,
             verticalCoefficients: verticalCoefficients,
+            correctionHorizontalCoefficients: [],
+            correctionVerticalCoefficients: [],
             averageErrorPercent: 0.0
         )
 
