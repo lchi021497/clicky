@@ -121,16 +121,23 @@ final class GazeTrackingManager: ObservableObject {
     @Published private(set) var isCalibrated: Bool = false
     @Published private(set) var lastCalibrationErrorPercent: Double?
 
-    /// 3x3 calibration grid inset 8% from the screen edges.
+    /// 4x4 calibration grid inset 8% from the screen edges (16 points).
     let calibrationTargets: [CGPoint] = [
         CGPoint(x: 0.08, y: 0.08),
-        CGPoint(x: 0.50, y: 0.08),
+        CGPoint(x: 0.36, y: 0.08),
+        CGPoint(x: 0.64, y: 0.08),
         CGPoint(x: 0.92, y: 0.08),
-        CGPoint(x: 0.08, y: 0.50),
-        CGPoint(x: 0.50, y: 0.50),
-        CGPoint(x: 0.92, y: 0.50),
+        CGPoint(x: 0.08, y: 0.36),
+        CGPoint(x: 0.36, y: 0.36),
+        CGPoint(x: 0.64, y: 0.36),
+        CGPoint(x: 0.92, y: 0.36),
+        CGPoint(x: 0.08, y: 0.64),
+        CGPoint(x: 0.36, y: 0.64),
+        CGPoint(x: 0.64, y: 0.64),
+        CGPoint(x: 0.92, y: 0.64),
         CGPoint(x: 0.08, y: 0.92),
-        CGPoint(x: 0.50, y: 0.92),
+        CGPoint(x: 0.36, y: 0.92),
+        CGPoint(x: 0.64, y: 0.92),
         CGPoint(x: 0.92, y: 0.92),
     ]
 
@@ -138,7 +145,7 @@ final class GazeTrackingManager: ObservableObject {
 
     private static let defaultWebSocketURLString = "wss://192.168.0.226:8443/gaze-live/gaze"
     private static let webSocketURLDefaultsKey = "jarvisGazeWebSocketURL"
-    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v4"
+    private static let calibrationDefaultsKey = "jarvisGazeCalibrationCoefficients_v5"
 
     /// One-Euro filter parameters: low minCutoff = rock-steady during fixations;
     /// higher beta = fast snap during saccades.
